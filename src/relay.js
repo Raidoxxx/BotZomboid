@@ -24,6 +24,37 @@ const text = (s, max=1024) => repair(s).replace(/[\u0000-\u001f]/g,' ').replace(
 const number = n => Number.isFinite(n) && n >= 0;
 const finiteInt = (n, min, max, fallback) => Number.isFinite(Number(n)) ? Math.min(max,Math.max(min,Math.floor(Number(n)))) : fallback;
 const cooldownKey = e => `herd:${e.kind}:${e.kind==='startup' ? e.data.session : e.data.herd || 'world'}:${e.priority}`;
+// The mod writes one alert per herd, up to 8 per update, so one scan can produce a dozen.
+const GROUPED = new Set(['nearby','approaching']);
+const GROUP_WINDOW_MS = 25000; // Longer than the 10 s between updates; a critical alert does not wait.
+const GROUP_RADIUS = 1000; // Beyond this a shared image would be too small to read.
+const MAX_GROUP = 32;
+const shortHerd = id => String(id ?? '?').split(':').pop();
+const observed = e => !(Array.isArray(e.data.players) && e.data.players.length>0 && e.data.players.every(p=>p.estimated));
+const located = p => Number.isFinite(p?.x) && Number.isFinite(p?.y);
+
+// Players of the lead alert. Alerts elsewhere on the map stay queued for their own message.
+function anchorOf(event) {
+  const players=(event.data.players || []).filter(located);
+  if(!players.length) return null;
+  return {x:players.reduce((sum,p)=>sum+p.x,0)/players.length,y:players.reduce((sum,p)=>sum+p.y,0)/players.length};
+}
+function closeTo(anchor,event) {
+  if(!anchor) return true;
+  const within=p=>!located(p) || Math.hypot(p.x-anchor.x,p.y-anchor.y)<=GROUP_RADIUS;
+  return within(event.data) && (event.data.players || []).every(within);
+}
+function groupFor(queue,lead,now) {
+  if(!GROUPED.has(lead.event.kind)) return [lead];
+  const anchor=anchorOf(lead.event), group=[lead];
+  for(const item of queue) {
+    if(group.length>=MAX_GROUP) break;
+    // Waiting out the window is fine to skip; a retry's backoff is not.
+    if(item===lead || !GROUPED.has(item.event.kind) || (item.attempt>0 && item.nextAt>now)) continue;
+    if(closeTo(anchor,item.event)) group.push(item);
+  }
+  return group;
+}
 
 export function webhookURL(raw) {
   let url;
@@ -54,7 +85,73 @@ export function parseLine(line) {
   } catch { return null; }
 }
 
+function finish(embed) {
+  // Hard budget, including user-controlled names and native zone labels.
+  let budget=5500-embed.title.length-embed.description.length-embed.footer.text.length;
+  embed.fields=embed.fields.filter(f=>{ budget-=f.name.length+f.value.length; return budget>=0; });
+  return {allowed_mentions:{parse:[],users:[],roles:[],replied_user:false},embeds:[embed]};
+}
+
+function chunkRows(fields,rows,name,continuation) {
+  let current=[],size=0,first=true;
+  const flush=()=>{ if(current.length) fields.push({name:first?name:continuation,value:current.join('\n'),inline:false}); first=false; current=[]; size=0; };
+  for(const row of rows) {
+    if(size+row.length+1>1000) flush();
+    current.push(row); size+=row.length+1;
+  }
+  flush();
+}
+
+// Several herds around the same players become one message with one line per herd.
+function groupPayload(events,serverName) {
+  const byHerd=new Map();
+  for(const e of events) byHerd.set(e.data.herd ?? e.id,e); // Newest data about a herd wins.
+  const herds=[...byHerd.values()];
+  const certain=herds.filter(observed);
+  const people=new Map();
+  const rows=herds.map(e=>{
+    const d=e.data; let nearest=null;
+    for(const p of Array.isArray(d.players) ? d.players : []) {
+      const known=people.get(p.name);
+      if(number(p.distance) && (!known || p.distance<known.distance)) people.set(p.name,{name:p.name,distance:p.distance,estimated:Boolean(p.estimated),
+        side:located(d) && located(p) ? compass(d.x-p.x,d.y-p.y) : null});
+      if(number(p.distance) && (!nearest || p.distance<nearest.distance)) nearest=p;
+    }
+    return {e,nearest,distance:nearest ? nearest.distance : Infinity};
+  }).sort((a,b)=>Number(observed(b.e))-Number(observed(a.e)) || a.distance-b.distance);
+  const lines=rows.map(({e,nearest})=>{
+    const d=e.data, parts=[];
+    if(Number.isFinite(d.count)) parts.push(`${d.count} walkers`);
+    if(nearest) {
+      const side=located(d) && located(nearest) ? compass(d.x-nearest.x,d.y-nearest.y) : null;
+      parts.push(`${Math.floor(nearest.distance)} tiles${side ? ` a ${side}` : ''}`);
+    }
+    if(d.state) parts.push(text(d.state,40));
+    const heading=located(d) && Number.isFinite(d.destX) && Number.isFinite(d.destY) ? compass(d.destX-d.x,d.destY-d.y) : null;
+    if(heading) parts.push(`rumo ${heading}`);
+    return `${observed(e) ? '🔴' : '🟡'} ${text(shortHerd(d.herd),40)} — ${parts.join(', ')}`;
+  });
+  const names=[...people.values()].sort((a,b)=>a.distance-b.distance);
+  const survivors=names.slice(0,32).map(p=>`${text(p.name,80)} — horda mais próxima a ${Math.floor(p.distance)} tiles${p.estimated ? ' (projeção)' : ''}${p.side ? `, a ${p.side}` : ''}`);
+  const fields=[];
+  chunkRows(fields,lines,'Hordas (🔴 observada, 🟡 estimada)','Hordas (continuação)');
+  chunkRows(fields,survivors,'Sobreviventes','Sobreviventes (continuação)');
+  // An estimate never sets the alarm: old mods can still report one as critical.
+  const level=Math.max(0,...certain.map(e=>e.data.level || 0));
+  const priority=Math.max(0,...certain.map(e=>e.priority));
+  const incoming=certain.some(e=>e.kind==='approaching');
+  fields.push({name:'Nível',value:certain.length ? ['','ATENÇÃO','PERIGO','CRÍTICO'][level] || 'ATENÇÃO' : 'NÃO CONFIRMADO',inline:true});
+  const estimates=herds.length-certain.length;
+  const title=!certain.length ? '❔ POSSÍVEIS HORDAS POR PERTO' : incoming ? '🚨 HORDAS SE APROXIMANDO' : '⚠️ JOGADOR PRÓXIMO DE HORDAS';
+  const color=!certain.length ? 0xf1c40f : priority>=3 ? 0xe74c3c : incoming || priority===1 ? 0xf1c40f : 0xe67e22;
+  const summary=[certain.length ? `${certain.length} com zumbis observados` : '', estimates ? `${estimates} só estimada${estimates===1?'':'s'}: pode não haver zumbis nesses pontos` : ''].filter(Boolean).join('; ');
+  return finish({title:`LIVING HERDS — ${title}`.slice(0,256),color,
+    description:text(`${herds.length} hordas na região. ${summary}.`,1000),fields,
+    timestamp:new Date(Math.min(...events.map(e=>e.at))).toISOString(),footer:{text:text(serverName,200)}});
+}
+
 export function payload(events,serverName) {
+  if(events.length>1 && events.every(e=>GROUPED.has(e.kind))) return groupPayload(events,serverName);
   const first=events[0], d=first.data;
   const fields=[];
   const field=(name,value) => { if (value!==undefined && value!==null && fields.length<25) fields.push({name,value:text(value),inline:true}); };
@@ -72,6 +169,8 @@ export function payload(events,serverName) {
     field('Maior horda',d.largest); field('Hordas próximas',d.nearHerds);
     field('Estados',Object.entries(d.states || {}).map(([s,n])=>`${s}: ${n}`).join(' | ') || 'Nenhuma horda');
     field('Jogadores conectados',d.connected ?? players.length);
+    field('Maior grupo real perto de um jogador',d.peakNear);
+    field('Hordas reais que chegaram perto',d.sightings);
   } else {
     field('Horda',d.herd); field('Walkers estimados',d.count); field('Estado',d.state);
     field('Região',d.region); field('Posição',d.positionKind);
@@ -95,10 +194,7 @@ export function payload(events,serverName) {
   const embed={title:`LIVING HERDS — ${unconfirmed ? '❔ POSSÍVEL HORDA POR PERTO' : TITLES[first.kind]}`.slice(0,256),color,
     description:text(d.description || (unconfirmed ? 'Posição estimada pelo gerenciador: pode não haver zumbis nesse ponto.' : first.kind==='report' ? 'Físicos são parte do total, nunca população adicional. Vínculos não confirmados não comprovam presença virtual.' : 'Evento registrado pelo gerenciador do servidor.'),1000),
     fields, timestamp:new Date(first.at).toISOString(),footer:{text:text(serverName,200)}};
-  // Hard budget, including user-controlled names and native zone labels.
-  let budget=5500-embed.title.length-embed.description.length-embed.footer.text.length;
-  embed.fields=fields.filter(f=>{ budget-=f.name.length+f.value.length; return budget>=0; });
-  return {allowed_mentions:{parse:[],users:[],roles:[],replied_user:false},embeds:[embed]};
+  return finish(embed);
 }
 
 export async function atomicState(path,state) {
@@ -124,8 +220,8 @@ export async function loadState(path) {
 }
 
 export class Relay {
-  constructor({url,state,clock=Date.now,fetchFn=fetch,log=console.log,serverName='Living Herds',maxPerMinute=6,render=renderMap}) {
-    this.render=render;
+  constructor({url,state,clock=Date.now,fetchFn=fetch,log=console.log,serverName='Living Herds',maxPerMinute=6,render=renderMap,groupWindowMs=GROUP_WINDOW_MS}) {
+    this.render=render; this.groupWindowMs=groupWindowMs;
     this.url=webhookURL(url); this.state=state; this.clock=clock; this.fetch=fetchFn; this.log=log;
     this.serverName=serverName; this.maxPerMinute=finiteInt(maxPerMinute,1,30,6); this.busy=false;
     const fingerprint=createHash('sha256').update(this.url.toString()).digest('hex');
@@ -160,7 +256,7 @@ export class Relay {
       if (s.queue[lowest].event.priority>=event.priority) return false;
       s.queue.splice(lowest,1);
     }
-    s.queue.push({event,nextAt:now+(event.priority===3?0:2000),attempt:0});
+    s.queue.push({event,nextAt:now+(event.priority===3?0:GROUPED.has(event.kind)?this.groupWindowMs:2000),attempt:0});
     return true;
   }
   async pump() {
@@ -187,10 +283,12 @@ export class Relay {
     const editing=e.kind==='report' && /^\d{17,20}$/.test(s.messageID || '');
     const target=new URL(this.url);
     if(editing) target.pathname+=`/messages/${s.messageID}`; else target.searchParams.set('wait','true');
-    const body=payload([e],this.serverName);
+    const group=groupFor(s.queue,item,now), events=group.map(i=>i.event);
+    const body=payload(events,this.serverName);
     // The alert matters more than its picture: any failure here sends the text alone.
     let image=null;
-    if(!editing && mapData(e)) { try { image=this.render(e); } catch { this.log('[BotZomboid] mapa nao gerado; enviando so o texto'); } }
+    const drawable=editing ? [] : events.filter(mapData);
+    if(drawable.length) { try { image=this.render(drawable.length===1 ? drawable[0] : drawable); } catch { this.log('[BotZomboid] mapa nao gerado; enviando so o texto'); } }
     let request;
     if(image) {
       body.embeds[0].image={url:'attachment://mapa.png'};
@@ -210,7 +308,7 @@ export class Relay {
       const raw=await response.text();
       if (raw.length<65536) { try { json=JSON.parse(raw); } catch {} }
     } catch {
-      const retry=this.retry(item,this.clock());
+      const retry=this.retryGroup(group,this.clock());
       this.log(`[BotZomboid] network failure; ${retry?'retry scheduled':'event dropped after six attempts'} (details suppressed)`); return false;
     }
     const received=this.clock();
@@ -231,21 +329,35 @@ export class Relay {
       this.log(`[BotZomboid] HTTP ${response.status}; webhook suspended for 15 minutes`); return false;
     }
     if(response.status>=500 || response.status===408) {
-      const retry=this.retry(item,received);
+      const retry=this.retryGroup(group,received);
       this.log(`[BotZomboid] HTTP ${response.status}; ${retry?'retry scheduled':'event dropped after six attempts'}`); return false;
     }
     if(response.status<200 || response.status>=300 || !/^\d{17,20}$/.test(json?.id || '')) {
       // wait=true/PATCH must confirm a message ID. Never announce success for an empty/malformed body.
-      s.queue=s.queue.filter(i=>i!==item); s.seen[e.id]=now;
+      s.queue=s.queue.filter(i=>!group.includes(i));
+      for(const sent of events) s.seen[sent.id]=now;
       this.log(`[BotZomboid] HTTP ${response.status}; delivery unconfirmed or rejected; event dropped`); return false;
     }
     if(e.kind==='report') s.messageID=json.id;
-    s.queue=s.queue.filter(i=>i!==item); s.seen[e.id]=now;
-    s.cooldowns[`type:${e.kind}`]=now+1000;
-    s.cooldowns[cooldownKey(e)]=now+e.cooldown;
-    if(e.kind==='nearby') for(const p of e.data.players || []) s.cooldowns[`player:${p.name}:${p.level}`]=now+e.cooldown;
-    this.log(`[BotZomboid] HTTP ${response.status}; ${editing?'message updated':'message confirmed'}; event=${e.kind}`);
+    s.queue=s.queue.filter(i=>!group.includes(i));
+    for(const sent of events) {
+      s.seen[sent.id]=now;
+      s.cooldowns[`type:${sent.kind}`]=now+1000;
+      s.cooldowns[cooldownKey(sent)]=now+sent.cooldown;
+      if(sent.kind==='nearby') for(const p of sent.data.players || []) s.cooldowns[`player:${p.name}:${p.level}`]=now+sent.cooldown;
+    }
+    this.log(`[BotZomboid] HTTP ${response.status}; ${editing?'message updated':'message confirmed'}; event=${e.kind}${events.length>1?`; alertas agrupados=${events.length}`:''}`);
     return true;
+  }
+  // The group fails and retries together, so a retry still sends one message.
+  retryGroup(group,now) {
+    const [lead,...rest]=group;
+    const retry=this.retry(lead,now);
+    for(const other of rest) {
+      if(retry) { other.attempt=lead.attempt; other.nextAt=lead.nextAt; }
+      else { this.state.queue=this.state.queue.filter(i=>i!==other); this.state.seen[other.event.id]=now; }
+    }
+    return retry;
   }
   retry(item,now) {
     item.attempt++;

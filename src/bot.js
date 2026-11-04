@@ -1,4 +1,7 @@
 import { rename } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { renderMap } from './map.js';
+import { WorldMapStore } from './worldmap.js';
 import { atomicState, loadState, Relay } from './relay.js';
 import { PanelClient, RemoteTail } from './panel.js';
 import { publicIp } from './network.js';
@@ -62,8 +65,12 @@ export async function run(config, {
   signal, log = console.log, panelFetch = fetch, discordFetch = fetch, ipFetch = fetch, clock = Date.now, tickMs = 1000,
 } = {}) {
   const state = await openState(config.stateFile, log);
-  const relay = new Relay({ url: config.webhook, state, clock, fetchFn: discordFetch, log, serverName: config.serverName, maxPerMinute: config.maxPerMinute });
   const client = new PanelClient({ baseUrl: config.panelUrl, apiKey: config.apiKey, fetchFn: panelFetch });
+  const worldMaps = config.worldMapFile
+    ? new WorldMapStore({ client, remotePath: config.worldMapFile, localPath: join(dirname(config.stateFile), 'pyramid.zip'), log, clock, signal })
+    : null;
+  const render = event => renderMap(event, { worldMap: worldMaps?.map });
+  const relay = new Relay({ url: config.webhook, state, clock, fetchFn: discordFetch, log, serverName: config.serverName, maxPerMinute: config.maxPerMinute, render });
   const report = reporter(log);
   log(`[BotZomboid] iniciado; Node ${process.versions.node}; painel ${new URL(config.panelUrl).host}; credenciais nunca sao registradas`);
   const ip = await publicIp(ipFetch);
@@ -88,6 +95,7 @@ export async function run(config, {
           tail = new RemoteTail(client, serverId, config.eventsFile, state.cursor);
         }
         const result = await tail.poll(event => relay.ingest(event));
+        worldMaps?.tick(tail.serverId); // Only after the panel answered: a rejected key must not cost extra calls.
         polls++; read += result.events; failures = 0;
         report(result.missing ? 'missing' : 'ok');
         nextPoll = clock() + config.pollMs;
@@ -119,5 +127,6 @@ export async function run(config, {
     }
   }
   await save().catch(() => {});
+  await worldMaps?.close();
   log('[BotZomboid] encerrado');
 }

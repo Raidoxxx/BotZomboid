@@ -9,6 +9,11 @@ const COLORS = {
   text: [232, 236, 240], herd: [226, 62, 62], estimated: [240, 180, 50], route: [240, 180, 50],
   player: [80, 165, 255], link: [110, 122, 138], band: [28, 34, 42],
 };
+// The game's map is light and busy: darker guides, and an outline around everything else.
+const ON_REAL_MAP = { ring: [24, 28, 34], link: [18, 22, 28] };
+const OUTLINE = [12, 14, 18];
+const RADAR_MIN_REACH = 50;
+const REAL_MAP_MIN_REACH = 160; // With the margin below, at least 200 tiles around the players show up.
 const COMPASS = ['Leste', 'Sudeste', 'Sul', 'Sudoeste', 'Oeste', 'Noroeste', 'Norte', 'Nordeste'];
 
 export function compass(dx, dy) {
@@ -53,6 +58,16 @@ class Canvas {
   constructor() {
     this.pixels = new Uint8Array(CANVAS * CANVAS * 3);
     for (let i = 0; i < this.pixels.length; i += 3) this.pixels.set(COLORS.background, i);
+  }
+  // Background sampled once per final pixel: drawing on top is what needs the double size.
+  paint(colorAt) {
+    for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+      const color = colorAt(x + 0.5, y + 0.5);
+      for (let sy = 0; sy < SCALE; sy++) for (let sx = 0; sx < SCALE; sx++) {
+        const i = ((y * SCALE + sy) * CANVAS + x * SCALE + sx) * 3;
+        this.pixels[i] = color[0]; this.pixels[i + 1] = color[1]; this.pixels[i + 2] = color[2];
+      }
+    }
   }
   dot(x, y, color) {
     const px = Math.round(x), py = Math.round(y);
@@ -154,58 +169,104 @@ export function mapData(event) {
   return players.length ? { d, players } : null;
 }
 
-export function renderMap(event) {
-  const data = mapData(event);
+// One marker per herd and per player: the newest data about each one wins.
+function gather(input) {
+  const entries = (Array.isArray(input) ? input : [input]).map(mapData).filter(Boolean);
+  if (!entries.length) return null;
+  const herds = new Map(), players = new Map();
+  entries.forEach(({ d, players: list }, i) => {
+    herds.set(d.herd ?? `#${i}`, { ...d, estimated: list.every(p => p.estimated) });
+    list.forEach((p, j) => players.set(p.name ?? `#${i}:${j}`, p));
+  });
+  return { herds: [...herds.values()], players: [...players.values()] };
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 'S'}`;
+
+function groupTitle(herds) {
+  const estimated = herds.filter(h => h.estimated).length, observed = herds.length - estimated;
+  if (!estimated) return `${herds.length} HORDAS OBSERVADAS`;
+  if (!observed) return `${herds.length} HORDAS ESTIMADAS`;
+  return `${herds.length} HORDAS: ${plural(observed, 'OBSERVADA')}, ${plural(estimated, 'ESTIMADA')}`;
+}
+
+export function renderMap(input, { worldMap = null } = {}) {
+  const data = gather(input);
   if (!data) return null;
-  const { d, players } = data;
+  const { herds, players } = data;
+  const single = herds.length === 1;
   const canvas = new Canvas();
   const center = {
     x: players.reduce((sum, p) => sum + p.x, 0) / players.length,
     y: players.reduce((sum, p) => sum + p.y, 0) / players.length,
   };
-  const estimated = players.every(p => p.estimated);
-  const reach = Math.max(50, ...players.map(p => Math.hypot(p.x - center.x, p.y - center.y)), Math.hypot(d.x - center.x, d.y - center.y)) * 1.25;
+  const away = (x, y) => Math.hypot(x - center.x, y - center.y);
+  const colors = worldMap ? { ...COLORS, ...ON_REAL_MAP } : COLORS;
+  const reach = Math.max(worldMap ? REAL_MAP_MIN_REACH : RADAR_MIN_REACH, ...players.map(p => away(p.x, p.y)), ...herds.map(h => away(h.x, h.y))) * 1.25;
   const middle = SIZE / 2 + 6, radius = 212, ratio = radius / reach;
   const toScreen = (x, y) => ({ x: SIZE / 2 + (x - center.x) * ratio, y: middle + (y - center.y) * ratio });
 
-  canvas.line(SIZE / 2, middle - radius, SIZE / 2, middle + radius, COLORS.axis);
-  canvas.line(SIZE / 2 - radius, middle, SIZE / 2 + radius, middle, COLORS.axis);
-  const step = NICE_STEPS.find(s => reach / s <= 4) ?? 5000;
-  for (let tiles = step; tiles <= reach; tiles += step) canvas.ring(SIZE / 2, middle, tiles * ratio, COLORS.ring);
-  const herd = toScreen(d.x, d.y);
-
-  // Link from the group to the herd, with the distance in the middle.
-  const distance = Math.round(Math.hypot(d.x - center.x, d.y - center.y));
-  canvas.line(SIZE / 2, middle, herd.x, herd.y, COLORS.link, 1, 5);
-
-  const count = Number.isFinite(d.count) ? d.count : 0;
-  const size = Math.min(30, 9 + Math.sqrt(Math.max(0, count)) * 1.3);
-
-  // Where the herd is heading. The route may leave the image, so its arrow is clipped.
-  if (coordinate(d.destX) && coordinate(d.destY) && Math.hypot(d.destX - d.x, d.destY - d.y) > 2) {
-    const length = Math.hypot(d.destX - d.x, d.destY - d.y);
-    const ux = (d.destX - d.x) / length, uy = (d.destY - d.y) / length;
-    const drawn = size + Math.max(30, Math.min(length * ratio, 90));
-    const headX = herd.x + ux * drawn, headY = herd.y + uy * drawn;
-    canvas.line(herd.x + ux * size, herd.y + uy * size, headX, headY, COLORS.route, 2);
-    canvas.line(headX, headY, headX - ux * 12 - uy * 7, headY - uy * 12 + ux * 7, COLORS.route, 2);
-    canvas.line(headX, headY, headX - ux * 12 + uy * 7, headY - uy * 12 - ux * 7, COLORS.route, 2);
-    canvas.label('RUMO', headX + ux * 8 - 12, headY + uy * 8 - 3, COLORS.route);
-  }
-
-  if (estimated) {
-    canvas.ring(herd.x, herd.y, size, COLORS.estimated, 2, 4);
-    canvas.label('ESTIMADA', herd.x - 24, herd.y + size + 6, COLORS.estimated);
+  if (worldMap) {
+    const sample = worldMap.sampler(1 / ratio);
+    canvas.paint((x, y) => sample(center.x + (x - SIZE / 2) / ratio, center.y + (y - middle) / ratio));
   } else {
-    canvas.disc(herd.x, herd.y, size, COLORS.herd);
+    canvas.line(SIZE / 2, middle - radius, SIZE / 2, middle + radius, COLORS.axis);
+    canvas.line(SIZE / 2 - radius, middle, SIZE / 2 + radius, middle, COLORS.axis);
   }
-  const amount = String(count);
-  canvas.text(amount, herd.x - canvas.textWidth(amount, 1) / 2, herd.y - 3, estimated ? COLORS.estimated : COLORS.text);
+  const stroke = (x0, y0, x1, y1, color, width) => {
+    if (worldMap) canvas.line(x0, y0, x1, y1, OUTLINE, width + 2);
+    canvas.line(x0, y0, x1, y1, color, width);
+  };
+  const step = NICE_STEPS.find(s => reach / s <= 4) ?? 5000;
+  for (let tiles = step; tiles <= reach; tiles += step) canvas.ring(SIZE / 2, middle, tiles * ratio, colors.ring);
+
+  const spots = herds.map(d => {
+    const count = Number.isFinite(d.count) ? d.count : 0;
+    return { d, count, at: toScreen(d.x, d.y), distance: Math.round(away(d.x, d.y)), size: Math.min(30, 9 + Math.sqrt(Math.max(0, count)) * 1.3) };
+  });
+  const nearest = spots.reduce((best, s) => (s.distance < best.distance ? s : best));
+
+  // Link to the herd, with the distance in the middle. A group lists its distances in the text.
+  if (single) canvas.line(SIZE / 2, middle, nearest.at.x, nearest.at.y, colors.link, 1, 5);
+
+  // Estimated and large markers go first, so they never hide an observed or a small herd.
+  const ordered = [...spots].sort((a, b) => Number(b.d.estimated) - Number(a.d.estimated) || b.size - a.size);
+
+  // Where each herd is heading. A route may leave the image, so its arrow is clipped.
+  for (const { d, at, size } of ordered) {
+    if (!coordinate(d.destX) || !coordinate(d.destY) || Math.hypot(d.destX - d.x, d.destY - d.y) <= 2) continue;
+    const length = Math.hypot(d.destX - d.x, d.destY - d.y);
+    const onScreen = length * ratio;
+    if (!single && onScreen <= 4) continue; // Already there: an arrow would only add noise.
+    const ux = (d.destX - d.x) / length, uy = (d.destY - d.y) / length;
+    const drawn = size + (single ? Math.max(30, Math.min(onScreen, 90)) : Math.max(12, Math.min(onScreen, 30)));
+    const head = single ? { back: 12, side: 7 } : { back: 7, side: 4 };
+    const headX = at.x + ux * drawn, headY = at.y + uy * drawn;
+    stroke(at.x + ux * size, at.y + uy * size, headX, headY, COLORS.route, 2);
+    stroke(headX, headY, headX - ux * head.back - uy * head.side, headY - uy * head.back + ux * head.side, COLORS.route, 2);
+    stroke(headX, headY, headX - ux * head.back + uy * head.side, headY - uy * head.back - ux * head.side, COLORS.route, 2);
+    if (single) canvas.label('RUMO', headX + ux * 8 - 12, headY + uy * 8 - 3, COLORS.route);
+  }
+
+  for (const { d, at, size, count } of ordered) {
+    if (d.estimated) {
+      if (worldMap) canvas.ring(at.x, at.y, size, OUTLINE, 4);
+      canvas.ring(at.x, at.y, size, COLORS.estimated, 2, 4);
+      if (single) canvas.label('ESTIMADA', at.x - 24, at.y + size + 6, COLORS.estimated);
+    } else {
+      if (worldMap) canvas.disc(at.x, at.y, size + 1.5, OUTLINE);
+      canvas.disc(at.x, at.y, size, COLORS.herd);
+    }
+    const amount = String(count);
+    if (d.estimated && worldMap) canvas.label(amount, at.x - canvas.textWidth(amount, 1) / 2, at.y - 3, COLORS.estimated);
+    else canvas.text(amount, at.x - canvas.textWidth(amount, 1) / 2, at.y - 3, d.estimated ? COLORS.estimated : COLORS.text);
+  }
 
   // Players on the same spot get stacked labels instead of unreadable overlapping text.
   const taken = [];
   for (const p of [...players].sort((a, b) => a.y - b.y).slice(0, 16)) {
     const spot = toScreen(p.x, p.y);
+    if (worldMap) canvas.disc(spot.x, spot.y, 6.5, OUTLINE);
     canvas.disc(spot.x, spot.y, 5, COLORS.player);
     let y = spot.y - 3;
     while (taken.some(t => Math.abs(t.y - y) < 12 && Math.abs(t.x - spot.x) < 110)) y += 12;
@@ -214,17 +275,21 @@ export function renderMap(event) {
   }
 
   // Header, footer and compass letters last, so nothing covers them.
-  const midX = (SIZE / 2 + herd.x) / 2, midY = (middle + herd.y) / 2;
-  if (distance > 0) canvas.label(`${distance} TILES`, midX - 22, midY - 12, COLORS.label);
+  const midX = (SIZE / 2 + nearest.at.x) / 2, midY = (middle + nearest.at.y) / 2;
+  if (single && nearest.distance > 0) canvas.label(`${nearest.distance} TILES`, midX - 22, midY - 12, COLORS.label);
   for (const [letter, x, y] of [['N', SIZE / 2 - 3, middle - radius - 3], ['S', SIZE / 2 - 3, middle + radius - 4], ['L', SIZE / 2 + radius - 3, middle - 3], ['O', SIZE / 2 - radius - 3, middle - 3]]) {
     canvas.label(letter, x, y, COLORS.text);
   }
   canvas.rect(0, 0, CANVAS, 30 * SCALE, COLORS.band);
   canvas.rect(0, (SIZE - 20) * SCALE, CANVAS, 20 * SCALE, COLORS.band);
-  const side = compass(d.x - center.x, d.y - center.y);
-  const title = `HORDA DE ${count} ${side ? `A ${side}` : 'AQUI'}${estimated ? ' (ESTIMADA)' : ''}`;
-  canvas.text(title, (SIZE - canvas.textWidth(title, 2)) / 2, 8, estimated ? COLORS.estimated : COLORS.text, 2);
-  canvas.text(`HORDA ${Math.round(d.x)},${Math.round(d.y)}`, 8, SIZE - 14, COLORS.label);
+  const allEstimated = herds.every(h => h.estimated);
+  const side = compass(nearest.d.x - center.x, nearest.d.y - center.y);
+  const title = single
+    ? `HORDA DE ${nearest.count} ${side ? `A ${side}` : 'AQUI'}${allEstimated ? ' (ESTIMADA)' : ''}`
+    : groupTitle(herds);
+  canvas.text(title, (SIZE - canvas.textWidth(title, 2)) / 2, 8, allEstimated ? COLORS.estimated : COLORS.text, 2);
+  const left = single ? `HORDA ${Math.round(nearest.d.x)},${Math.round(nearest.d.y)}` : 'VERMELHO: OBSERVADA  AMARELO: ESTIMADA';
+  canvas.text(left, 8, SIZE - 14, COLORS.label);
   const scale = `ANEIS: ${step} TILES`;
   canvas.text(scale, SIZE - canvas.textWidth(scale, 1) - 8, SIZE - 14, COLORS.label);
   return png(canvas.downsampled());

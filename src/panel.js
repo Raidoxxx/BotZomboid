@@ -1,7 +1,11 @@
+import { createWriteStream } from 'node:fs';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { parseLine } from './relay.js';
 
 const USER_AGENT = 'BotZomboid/0.3.0';
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024;
 
 // Kinds, never bodies: an error response could echo headers or file contents.
 export class PanelError extends Error {
@@ -49,6 +53,44 @@ export class PanelClient {
     const response = await this.request(`/api/client/servers/${encodeURIComponent(serverId)}/files/contents?file=${encodeURIComponent(path)}`);
     const bytes = Buffer.from(await response.arrayBuffer().catch(() => { throw new PanelError('network'); }));
     if (bytes.length > MAX_FILE_BYTES) throw new PanelError('too-large');
+    return bytes;
+  }
+  async downloadUrl(serverId, path) {
+    const response = await this.request(`/api/client/servers/${encodeURIComponent(serverId)}/files/download?file=${encodeURIComponent(path)}`);
+    let url;
+    try { url = new URL((await response.json()).attributes.url); } catch { throw new PanelError('invalid-response'); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new PanelError('invalid-response');
+    return url;
+  }
+  // Streams to disk, so a large file does not use memory. The link is signed by the panel:
+  // the API key is never sent to the node, and the link itself is never logged.
+  async download(serverId, path, file, { signal, maxBytes = MAX_DOWNLOAD_BYTES } = {}) {
+    const url = await this.downloadUrl(serverId, path);
+    let response;
+    try { response = await this.fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal }); } catch { throw new PanelError('network'); }
+    if (!response.ok) {
+      const { status } = response;
+      await response.body?.cancel().catch(() => {});
+      throw new PanelError(status === 404 ? 'missing' : status >= 500 ? 'server' : 'http', status);
+    }
+    if (!response.body) throw new PanelError('invalid-response');
+    if (Number(response.headers.get('content-length')) > maxBytes) {
+      await response.body.cancel().catch(() => {});
+      throw new PanelError('too-large');
+    }
+    let bytes = 0;
+    try {
+      await pipeline(Readable.fromWeb(response.body), async function* (source) {
+        for await (const part of source) {
+          bytes += part.length;
+          if (bytes > maxBytes) throw new PanelError('too-large');
+          yield part;
+        }
+      }, createWriteStream(file, { mode: 0o600 }));
+    } catch (error) {
+      if (error instanceof PanelError) throw error;
+      throw new PanelError(error.syscall ? 'disk' : 'network');
+    }
     return bytes;
   }
 }

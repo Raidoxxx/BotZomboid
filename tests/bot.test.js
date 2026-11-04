@@ -15,7 +15,7 @@ import { MARKER } from '../src/relay.js';
 // Non-secret fixtures.
 const KEY = `ptlc_${'a'.repeat(40)}`;
 const HOOK = `https://discord.com/api/webhooks/${'1'.repeat(18)}/${'x'.repeat(24)}`;
-const ENV = { PANEL_URL: 'https://painel.exemplo.com', PANEL_API_KEY: KEY, DISCORD_WEBHOOK_URL: HOOK };
+const ENV = { PANEL_URL: 'https://painel.exemplo.com', PANEL_API_KEY: KEY, DISCORD_WEBHOOK_URL: HOOK, WORLD_MAP_FILE: '' };
 const line = (id, kind = 'created', at = Date.now()) =>
   MARKER + JSON.stringify({ v: 1, id, kind, priority: 3, at, cooldown: 60000, maxPerMinute: 6, data: { herd: id, count: 12, state: 'MERGING' } }) + '\n';
 const client = sequence => {
