@@ -1,0 +1,13 @@
+{
+  "name": "botzomboid",
+  "version": "0.3.0",
+  "description": "Publica no Discord os eventos do mod Living Herds, lendo o arquivo do servidor pela API do Pterodactyl.",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  }
+}
