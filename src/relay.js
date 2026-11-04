@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { open, readFile, rename, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { compass, mapData, renderMap } from './map.js';
 
 export const MARKER = '[LivingHerdsDiscord] ';
 const KINDS = new Set(['startup','created','merged','split','migration','mega','base','dispersed','destroyed','nearby','approaching','report','test']);
@@ -11,7 +12,15 @@ const TITLES = {
   dispersed:'🟢 HORDA DISPERSADA', destroyed:'🟢 HORDA ELIMINADA', nearby:'⚠️ JOGADOR PRÓXIMO DE UMA HORDA',
   approaching:'🚨 HORDA SE APROXIMANDO', report:'📊 RELATÓRIO GLOBAL', test:'🔧 TESTE ADMINISTRATIVO',
 };
-const text = (s, max=1024) => String(s ?? '').replace(/[\u0000-\u001f]/g,' ').replace(/([`*_~|<>\\])/g,'\\$1').slice(0,max);
+// Mods up to 0.3.0 lose accents inside the game (its Lua lexer truncates non-ASCII literals),
+// so these words arrive with U+FFFD in the file. Words that are not listed stay as they are.
+const MANGLED = new Map(Object.entries({
+  'Regi\uFFFDo':'Região', 'n\uFFFDo':'não', 'dist\uFFFDncia':'distância', 'proje\uFFFD\uFFFDo':'projeção',
+  'l\uFFFDgica':'lógica', 'presen\uFFFDa':'presença', 'f\uFFFDsica':'física', 'v\uFFFDnculos':'vínculos',
+  'confirma\uFFFD\uFFFDo':'confirmação', 'integra\uFFFD\uFFFDo':'integração', 'est\uFFFD':'está',
+}));
+export const repair = s => String(s ?? '').replace(/[\p{L}\uFFFD]*\uFFFD[\p{L}\uFFFD]*/gu, word => MANGLED.get(word) ?? word);
+const text = (s, max=1024) => repair(s).replace(/[\u0000-\u001f]/g,' ').replace(/([`*_~|<>\\])/g,'\\$1').slice(0,max);
 const number = n => Number.isFinite(n) && n >= 0;
 const finiteInt = (n, min, max, fallback) => Number.isFinite(Number(n)) ? Math.min(max,Math.max(min,Math.floor(Number(n)))) : fallback;
 const cooldownKey = e => `herd:${e.kind}:${e.kind==='startup' ? e.data.session : e.data.herd || 'world'}:${e.priority}`;
@@ -50,6 +59,9 @@ export function payload(events,serverName) {
   const fields=[];
   const field=(name,value) => { if (value!==undefined && value!==null && fields.length<25) fields.push({name,value:text(value),inline:true}); };
   const players=events.flatMap(e=>Array.isArray(e.data.players) ? e.data.players : []);
+  // A projection is not a sighting: all-estimated alerts must not read as a confirmed danger.
+  const unconfirmed=first.kind==='nearby' && players.length>0 && players.every(p=>p.estimated);
+  const heading=Number.isFinite(d.x) && Number.isFinite(d.y) && Number.isFinite(d.destX) && Number.isFinite(d.destY) ? compass(d.destX-d.x,d.destY-d.y) : null;
   if (first.kind==='startup') {
     field('Versão do jogo',d.gameVersion);
     field('Gerenciamento de hordas',d.systemEnabled ? 'Ativo' : 'Pausado no Sandbox');
@@ -66,17 +78,22 @@ export function payload(events,serverName) {
     field('Distância aproximada (tiles)',d.distance); field('Direção observada',d.direction);
     field('Velocidade observada (tiles/s reais)',d.speed);
     field('Outra horda',d.other); field('Nova horda',d.child); field('Base cadastrada',d.base); field('Motivo',d.reason);
-    if (d.level) field('Nível',['','ATENÇÃO','PERIGO','CRÍTICO'][d.level]);
+    if (heading) field('Rumo da horda',heading);
+    if (Number.isFinite(d.x) && Number.isFinite(d.y)) field('Coordenadas da horda',`${Math.round(d.x)}, ${Math.round(d.y)}`);
+    if (d.level) field('Nível',unconfirmed ? 'NÃO CONFIRMADO' : ['','ATENÇÃO','PERIGO','CRÍTICO'][d.level]);
   }
   if (players.length) {
-    const rows=players.slice(0,32).map(p=>`${text(p.name,80)} — ${number(p.distance) ? `${Math.floor(p.distance)} tiles${p.estimated ? ' (projeção)' : ''}` : 'nenhuma horda próxima'}${p.herd ? ` — ${text(p.herd,100)}` : ''}`);
+    const rows=players.slice(0,32).map(p=>{
+      const side=Number.isFinite(d.x) && Number.isFinite(p.x) && Number.isFinite(d.y) && Number.isFinite(p.y) ? compass(d.x-p.x,d.y-p.y) : null;
+      return `${text(p.name,80)} — ${number(p.distance) ? `${Math.floor(p.distance)} tiles${p.estimated ? ' (projeção)' : ''}${side ? `, horda a ${side}` : ''}` : 'nenhuma horda próxima'}${p.herd ? ` — ${text(p.herd,100)}` : ''}`;
+    });
     // Embed totals remain below Discord's 6000 character aggregate limit.
     for(let i=0;i<rows.length && fields.length<22;i+=8) fields.push({name:i===0?'Sobreviventes':'Sobreviventes (continuação)',value:rows.slice(i,i+8).join('\n').slice(0,1000),inline:false});
   }
   if (events.length>1 && first.kind!=='nearby') field('Eventos consolidados',events.length);
-  const color=first.priority>=3 ? 0xe74c3c : first.kind==='approaching' || first.kind==='nearby' && first.priority===1 ? 0xf1c40f : first.priority===2 ? 0xe67e22 : first.kind==='report' ? 0x3498db : 0x2ecc71;
-  const embed={title:`LIVING HERDS — ${TITLES[first.kind]}`.slice(0,256),color,
-    description:text(d.description || (first.kind==='report' ? 'Físicos são parte do total, nunca população adicional. Vínculos não confirmados não comprovam presença virtual.' : 'Evento registrado pelo gerenciador do servidor.'),1000),
+  const color=unconfirmed ? 0xf1c40f : first.priority>=3 ? 0xe74c3c : first.kind==='approaching' || first.kind==='nearby' && first.priority===1 ? 0xf1c40f : first.priority===2 ? 0xe67e22 : first.kind==='report' ? 0x3498db : 0x2ecc71;
+  const embed={title:`LIVING HERDS — ${unconfirmed ? '❔ POSSÍVEL HORDA POR PERTO' : TITLES[first.kind]}`.slice(0,256),color,
+    description:text(d.description || (unconfirmed ? 'Posição estimada pelo gerenciador: pode não haver zumbis nesse ponto.' : first.kind==='report' ? 'Físicos são parte do total, nunca população adicional. Vínculos não confirmados não comprovam presença virtual.' : 'Evento registrado pelo gerenciador do servidor.'),1000),
     fields, timestamp:new Date(first.at).toISOString(),footer:{text:text(serverName,200)}};
   // Hard budget, including user-controlled names and native zone labels.
   let budget=5500-embed.title.length-embed.description.length-embed.footer.text.length;
@@ -107,7 +124,8 @@ export async function loadState(path) {
 }
 
 export class Relay {
-  constructor({url,state,clock=Date.now,fetchFn=fetch,log=console.log,serverName='Living Herds',maxPerMinute=6}) {
+  constructor({url,state,clock=Date.now,fetchFn=fetch,log=console.log,serverName='Living Herds',maxPerMinute=6,render=renderMap}) {
+    this.render=render;
     this.url=webhookURL(url); this.state=state; this.clock=clock; this.fetch=fetchFn; this.log=log;
     this.serverName=serverName; this.maxPerMinute=finiteInt(maxPerMinute,1,30,6); this.busy=false;
     const fingerprint=createHash('sha256').update(this.url.toString()).digest('hex');
@@ -170,11 +188,23 @@ export class Relay {
     const target=new URL(this.url);
     if(editing) target.pathname+=`/messages/${s.messageID}`; else target.searchParams.set('wait','true');
     const body=payload([e],this.serverName);
+    // The alert matters more than its picture: any failure here sends the text alone.
+    let image=null;
+    if(!editing && mapData(e)) { try { image=this.render(e); } catch { this.log('[BotZomboid] mapa nao gerado; enviando so o texto'); } }
+    let request;
+    if(image) {
+      body.embeds[0].image={url:'attachment://mapa.png'};
+      body.attachments=[{id:0,filename:'mapa.png'}];
+      request=new FormData();
+      request.set('payload_json',JSON.stringify(body));
+      request.set('files[0]',new Blob([image],{type:'image/png'}),'mapa.png');
+    } else request=JSON.stringify(body);
     s.sent.push(now); // Count every HTTP attempt, including retries and PATCH.
     let response, json;
     try {
-      response=await this.fetch(target,{method:editing?'PATCH':'POST',body:JSON.stringify(body),
-        headers:{'Content-Type':'application/json','User-Agent':'BotZomboid/0.3.0'},
+      response=await this.fetch(target,{method:editing?'PATCH':'POST',body:request,
+        // fetch sets the multipart boundary itself.
+        headers:image ? {'User-Agent':'BotZomboid/0.3.0'} : {'Content-Type':'application/json','User-Agent':'BotZomboid/0.3.0'},
         signal:AbortSignal.timeout(10000),redirect:'error'});
       // Never log response bodies: they can echo webhook credentials or player names.
       const raw=await response.text();

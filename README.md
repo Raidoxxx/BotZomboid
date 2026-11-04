@@ -10,6 +10,19 @@ Servidor PZ (mod) --grava--> arquivo de eventos <--API do Pterodactyl-- BotZombo
 
 Os alertas chegam com um atraso de até `POLL_SECONDS` (20 segundos por padrão).
 
+## Mapa nos alertas
+
+Alertas de jogador próximo e de horda se aproximando trazem uma imagem com o norte para cima, centrada nos jogadores:
+
+- **Azul:** jogadores.
+- **Vermelho cheio:** horda com zumbis observados, com a quantidade dentro.
+- **Amarelo tracejado:** posição só estimada; pode não haver zumbis ali.
+- **Seta `RUMO`:** para onde a horda está indo.
+
+É um radar, sem o desenho das ruas. Para ver o lugar, use o campo `Coordenadas da horda` em um mapa de Project Zomboid.
+
+O mapa exige o mod Living Herds 0.3.1 ou superior no servidor, com `DiscordMapCoordinates = true`. **Quem vê o canal vê a posição dos jogadores envolvidos.** Com o mod antigo ou essa opção desligada, o alerta chega só com texto.
+
 ## Antes de começar
 
 No **Sandbox do servidor**, ative `DiscordWebhookEnabled = true` na seção `LivingHerds`. Sem isso o mod não cria o arquivo.
