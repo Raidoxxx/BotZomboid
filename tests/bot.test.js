@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { parseEnv, loadConfig, loadEnvFile } from '../src/config.js';
 import { PanelClient, PanelError, RemoteTail } from '../src/panel.js';
 import { run } from '../src/bot.js';
+import { publicIp } from '../src/network.js';
 import { MARKER } from '../src/relay.js';
 
 // Non-secret fixtures.
@@ -147,7 +148,7 @@ test('tail keeps its position across a restart', async () => {
 
 function harness(config) {
   const logs = [], controller = new AbortController();
-  return { logs, controller, options: extra => ({ signal: controller.signal, log: s => logs.push(s), tickMs: 5, ...extra }), config };
+  return { logs, controller, options: extra => ({ signal: controller.signal, log: s => logs.push(s), tickMs: 5, ipFetch: async () => new Response('203.0.113.7\n'), ...extra }), config };
 }
 const until = async (check, ms = 5000) => {
   const end = Date.now() + ms;
@@ -236,6 +237,44 @@ test('several servers on the account require SERVER_ID, without guessing', async
   const h = harness(config);
   const panelFetch = async () => new Response(JSON.stringify({ data: [{ attributes: { identifier: 'aaaa1111' } }, { attributes: { identifier: 'bbbb2222' } }] }), { status: 200 });
   await assert.rejects(run(config, h.options({ panelFetch })), /SERVER_ID.*aaaa1111.*bbbb2222/);
+  await rm(dir, { recursive: true });
+});
+
+test('public IP lookup uses the next source and never throws', async () => {
+  const calls = [];
+  const sources = ['https://a.exemplo.com', 'https://b.exemplo.com'];
+  const reply = answers => async (url, init) => {
+    calls.push({ url, init });
+    const answer = answers.shift();
+    if (answer instanceof Error) throw answer;
+    return answer;
+  };
+  assert.equal(await publicIp(reply([new Response('203.0.113.7\n')]), sources), '203.0.113.7');
+  assert.equal(await publicIp(reply([new Response('2001:db8::1')]), sources), '2001:db8::1');
+  assert.equal(await publicIp(reply([new Error('offline'), new Response('203.0.113.8')]), sources), '203.0.113.8');
+  assert.equal(await publicIp(reply([new Response('', { status: 500 }), new Response('203.0.113.9')]), sources), '203.0.113.9');
+  assert.equal(await publicIp(reply([new Response('<html>nao e ip</html>'), new Error('offline')]), sources), null);
+  for (const { init } of calls) {
+    assert.equal(init.redirect, 'error');
+    assert.deepEqual(Object.keys(init.headers), ['User-Agent']); // No credential leaves with this request.
+  }
+});
+
+test('startup log shows the public IP, and a failed lookup does not stop the bot', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bz-'));
+  const config = { ...loadConfig({ ...ENV, SERVER_ID: 'abcd1234' }), pollMs: 5, stateFile: join(dir, 'state.json') };
+  const panelFetch = async () => new Response('', { status: 200 });
+  const discordFetch = async () => assert.fail('nothing to send');
+  const ok = harness(config);
+  let running = run(config, ok.options({ panelFetch, discordFetch }));
+  await until(() => ok.logs.some(s => s.includes('lendo o arquivo')));
+  ok.controller.abort(); await running;
+  assert.ok(ok.logs.includes('[BotZomboid] IP publico: 203.0.113.7'));
+  const down = harness(config);
+  running = run(config, down.options({ panelFetch, discordFetch, ipFetch: async () => { throw new Error('offline'); } }));
+  await until(() => down.logs.some(s => s.includes('lendo o arquivo')));
+  down.controller.abort(); await running;
+  assert.ok(down.logs.includes('[BotZomboid] IP publico: nao foi possivel descobrir'));
   await rm(dir, { recursive: true });
 });
 

@@ -39,12 +39,12 @@ O `discloud.config` usa `VERSION=latest` e 100 MB de RAM. O bot exige Node 20 ou
 
 ## Como saber se funcionou
 
-O log deve mostrar `iniciado` e depois `lendo o arquivo de eventos`. Se aparecer outra mensagem:
+O log deve mostrar `iniciado`, o `IP publico` do bot e depois `lendo o arquivo de eventos`. Esse é o IP para colocar na lista de IPs da chave do painel; ele pode mudar quando o bot for reiniciado ou publicado de novo. Para descobri-lo, o bot faz uma consulta anônima a `api.ipify.org` ou `icanhazip.com`, sem enviar chave ou webhook. Se aparecer outra mensagem:
 
 | Mensagem no log | O que fazer |
 |---|---|
 | `o painel recusou a chave (HTTP 401)` | Crie uma nova chave e atualize `PANEL_API_KEY` |
-| `a chave nao tem acesso a este servidor (HTTP 403)` | Confira `SERVER_ID` e, se a chave tiver lista de IPs, libere o IP do Discloud ou deixe a lista vazia |
+| `a chave nao tem acesso a este servidor (HTTP 403)` | Confira `SERVER_ID` e, se a chave tiver lista de IPs, inclua o `IP publico` do log ou deixe a lista vazia |
 | `HTTP 403 sem resposta da API` | Um firewall do painel está bloqueando o bot. Peça à hospedagem para liberar `/api/client` |
 | `servidor ou arquivo nao encontrado` | Ative `DiscordWebhookEnabled`, reinicie o jogo e confira `EVENTS_FILE` |
 | `PANEL_URL respondeu, mas nao parece um Pterodactyl` | Confira o endereço do painel |

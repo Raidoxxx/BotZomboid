@@ -1,6 +1,7 @@
 import { rename } from 'node:fs/promises';
 import { atomicState, loadState, Relay } from './relay.js';
 import { PanelClient, RemoteTail } from './panel.js';
+import { publicIp } from './network.js';
 
 const LONG_PAUSE_MS = 15 * 60 * 1000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
@@ -58,13 +59,15 @@ async function resolveServer(config, client, log) {
 }
 
 export async function run(config, {
-  signal, log = console.log, panelFetch = fetch, discordFetch = fetch, clock = Date.now, tickMs = 1000,
+  signal, log = console.log, panelFetch = fetch, discordFetch = fetch, ipFetch = fetch, clock = Date.now, tickMs = 1000,
 } = {}) {
   const state = await openState(config.stateFile, log);
   const relay = new Relay({ url: config.webhook, state, clock, fetchFn: discordFetch, log, serverName: config.serverName, maxPerMinute: config.maxPerMinute });
   const client = new PanelClient({ baseUrl: config.panelUrl, apiKey: config.apiKey, fetchFn: panelFetch });
   const report = reporter(log);
   log(`[BotZomboid] iniciado; Node ${process.versions.node}; painel ${new URL(config.panelUrl).host}; credenciais nunca sao registradas`);
+  const ip = await publicIp(ipFetch);
+  log(`[BotZomboid] IP publico: ${ip || 'nao foi possivel descobrir'}`);
 
   let tail = null, failures = 0, nextPoll = 0, polls = 0, read = 0, nextBeat = clock() + HEARTBEAT_MS;
   let saved = JSON.stringify(state);
